@@ -1,0 +1,17 @@
+# compiled target
+note
+*.o
+*.out
+
+# core dumps
+core
+core.*
+*.core
+
+# python
+__pycache__/
+*.pyc
+
+# editor / OS
+*.swp
+.DS_Store
