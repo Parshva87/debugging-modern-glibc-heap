@@ -3,7 +3,7 @@ CC      ?= gcc
 CFLAGS  := -no-pie -fno-stack-protector
 TARGET  := note
 
-.PHONY: all build run clean
+.PHONY: all build run clean tune
 
 all: build
 
@@ -18,3 +18,6 @@ run: build
 
 clean:
 	rm -f $(TARGET) core core.* *.core
+
+tune: note
+	gdb -q -batch -x tune.gdb ./note

@@ -58,8 +58,9 @@ every mitigation the allocator throws back:
 | 4 | Self-locating scan for `main`'s saved RIP | (env-size independent) |
 | 5 | tcache poison → overwrite saved RIP with a ROP chain → `execve("/bin/sh")` | hooks removed (2.34) |
 
-Everything libc-relative is resolved from the target libc via pwntools, so it ports to another
-glibc by swapping the libc path and re-measuring three documented constants (see **Porting**).
+Everything libc-relative is resolved from the target libc via pwntools, and the two version-specific
+offsets **auto-tune to whatever glibc you're on** when run locally — so a fresh clone just runs
+(see **Porting**). Against a remote target you hardcode them instead.
 
 ---
 
@@ -117,19 +118,31 @@ Legend: ● works · ◐ works with a leak/adaptation · ○ dead · — mechani
 
 ## Porting to your glibc
 
-Point `LIBC` in `exploit.py` at your target's libc. `system`, `/bin/sh`, and the ROP gadgets all
-resolve automatically once `LIBC.address` is set. Re-measure three constants:
+**Running locally, you don't have to do anything** — the exploit self-tunes:
 
-- `UNSORTED_OFF` — the libc pointer a lone unsorted chunk leaks (`main_arena + 0x60`):
-  `gdb -q ./note -ex 'b main' -ex run -ex 'p/x (long)&main_arena'`, subtract libc base, add `0x60`.
-- `MAIN_RET_OFF` — the value sitting at `main`'s saved RIP (the scan target):
-  `b main; run; up; x/gx $rbp+8`, subtract libc base.
-- The heap chunk offsets (`a0`..`a3`) assume the allocation order in the script; change sizes/order
-  and re-dump the layout in gdb.
+- `system`, `/bin/sh`, and the ROP gadgets resolve from your libc once `LIBC.address` is set.
+- `UNSORTED_OFF` (the `main_arena + 0x60` offset) is calibrated at runtime from the child's own
+  memory map (`io.libc.address`), while the unsorted-bin leak is still performed for real.
+- `MAIN_RET_OFF` (the scan target at `main`'s saved RIP) comes from
+  `LIBC.libc_start_main_return`, which pwntools derives by disassembling `__libc_start_main` — so
+  it's correct on any glibc, no gdb needed.
+- The heap chunk offsets (`a0`..`a3`) are stable across modern glibc: safe-linking cancels
+  low-bit layout differences, and `tcache_perthread_struct` is byte-identical 2.30 → 2.41.
 
-Measured here (glibc 2.39): `UNSORTED_OFF = 0x203b20`, `MAIN_RET_OFF = 0x2a1ca`,
-`environ − saved_RIP = 0x130` (empty env; the script self-locates via the scan, so this is
-informational).
+So on a newer distro (e.g. Kali rolling) a clean `make run` should just pop.
+
+**Against a remote target** (`io = remote(...)`, so `io.libc` is `None`), the two offsets fall back
+to the hardcoded literals at the top of `exploit.py`. Measure them once for the target's libc with
+the bundled tuner and paste them in:
+
+```sh
+gdb -q -batch -x tune.gdb ./note      # or: make tune
+# -> UNSORTED_OFF = 0x...
+# -> MAIN_RET_OFF = 0x...
+```
+
+Reference values for glibc 2.39: `UNSORTED_OFF = 0x203b20`, `MAIN_RET_OFF = 0x2a1ca`,
+`environ − saved_RIP = 0x130` (empty env).
 
 ---
 
@@ -139,7 +152,8 @@ informational).
 .
 ├── note.c                    # the vulnerable "babyheap" binary (UAF)
 ├── exploit.py                # the modern chain, fully commented
-├── Makefile                  # make build / run / clean
+├── tune.gdb                  # measure the 2 offsets for a remote libc
+├── Makefile                  # make build / run / clean / tune
 ├── docs/
 │   ├── version-matrix.md     # full mitigation + technique matrix (source-verified)
 │   └── version-matrix.html   # printable one-page field reference
