@@ -15,3 +15,10 @@ __pycache__/
 # editor / OS
 *.swp
 .DS_Store
+
+# Presentation prep (personal)
+speaker-notes.md
+word-for-word-script.md
+cmd-cheatsheet.md
+demo-runbook.md
+.gdb_history

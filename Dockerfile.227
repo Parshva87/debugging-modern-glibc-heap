@@ -1,0 +1,23 @@
+# Dockerfile.227 — glibc 2.27 (Ubuntu 18.04) for slide 24 proof
+# Unsorted-bin attack guard is ABSENT on this version.
+#
+# Build:   docker build -f Dockerfile.227 -t heap-227 .
+# Run:     docker run --rm -it heap-227
+# Inside:  strings /lib/x86_64-linux-gnu/libc.so.6 | grep "corrupted unsorted"
+#          → NO OUTPUT (check doesn't exist — attack still works)
+
+FROM ubuntu:18.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# 18.04 LTS repos may need old-releases after EOL
+RUN apt-get update 2>/dev/null || \
+    (sed -i 's|archive.ubuntu.com|old-releases.ubuntu.com|g; \
+             s|security.ubuntu.com|old-releases.ubuntu.com|g' \
+        /etc/apt/sources.list && apt-get update)
+
+RUN apt-get install -y --no-install-recommends binutils \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PS1='glibc-2.27$ '
+CMD ["bash"]

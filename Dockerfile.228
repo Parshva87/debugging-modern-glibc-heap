@@ -1,0 +1,23 @@
+# Dockerfile.228 — glibc 2.28 (Ubuntu 18.10) for slide 24 proof
+# Unsorted-bin attack guard IS PRESENT on this version.
+# The internet says 2.29 — this container proves it was 2.28.
+#
+# Build:   docker build -f Dockerfile.228 -t heap-228 .
+# Run:     docker run --rm -it heap-228
+# Inside:  strings /lib/x86_64-linux-gnu/libc.so.6 | grep "corrupted unsorted"
+#          → SHOWS the strings (check is here — attack dies)
+
+FROM ubuntu:18.10
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# 18.10 (Cosmic) is EOL — repos on old-releases
+RUN sed -i 's|archive.ubuntu.com|old-releases.ubuntu.com|g; \
+             s|security.ubuntu.com|old-releases.ubuntu.com|g' \
+        /etc/apt/sources.list && apt-get update
+
+RUN apt-get install -y --no-install-recommends binutils \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PS1='glibc-2.28$ '
+CMD ["bash"]
